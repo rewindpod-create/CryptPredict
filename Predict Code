@@ -1,0 +1,604 @@
+use anchor_lang::prelude::*;
+use anchor_lang::solana_program::clock::Clock;
+use pyth_sdk_solana::load_price_feed_from_account_info;
+use std::mem::size_of;
+
+declare_id!("11111111111111111111111111111111"); // Replace with your deployed program ID
+
+#[program]
+pub mod solana_prediction_game {
+    use super::*;
+
+    /// Initialize the program with the owner wallet
+    pub fn initialize(ctx: Context<Initialize>) -> Result<()> {
+        let game_state = &mut ctx.accounts.game_state;
+        game_state.authority = ctx.accounts.authority.key();
+        game_state.total_higher_pool = 0;
+        game_state.total_lower_pool = 0;
+        game_state.total_fees_collected = 0;
+        game_state.bump = ctx.bumps.game_state;
+        
+        msg!("Game initialized with authority: {}", game_state.authority);
+        Ok(())
+    }
+
+    /// Place a bet (HIGHER or LOWER)
+    pub fn place_bet(
+        ctx: Context<PlaceBet>,
+        bet_amount: u64,
+        prediction: PredictionType,
+    ) -> Result<()> {
+        let clock = Clock::get()?;
+        let current_time = clock.unix_timestamp;
+
+        // Validate bet amount
+        require!(
+            bet_amount >= 10_000_000, // 0.01 SOL in lamports
+            GameError::BetTooSmall
+        );
+        require!(
+            bet_amount <= 20_000_000_000, // 20 SOL in lamports
+            GameError::BetTooLarge
+        );
+
+        // Get current SOL price from Pyth
+        let price_feed = load_price_feed_from_account_info(&ctx.accounts.pyth_price_account)
+            .map_err(|_| GameError::InvalidPriceAccount)?;
+        
+        let current_price = price_feed
+            .get_current_price()
+            .ok_or(GameError::PriceUnavailable)?;
+
+        require!(current_price.price > 0, GameError::InvalidPrice);
+
+        // Store the current price with precision (convert to hundredths)
+        let price_in_hundredths = (current_price.price as i128)
+            .checked_mul(100)
+            .ok_or(GameError::MathOverflow)?
+            .checked_div(10i128.pow((-current_price.expo) as u32))
+            .ok_or(GameError::MathOverflow)? as i64;
+
+        // Initialize user bet
+        let user_bet = &mut ctx.accounts.user_bet;
+        user_bet.user = ctx.accounts.user.key();
+        user_bet.bet_amount = bet_amount;
+        user_bet.prediction = prediction;
+        user_bet.entry_price = price_in_hundredths;
+        user_bet.entry_time = current_time;
+        user_bet.settlement_time = current_time + 5; // 5 seconds from now
+        user_bet.is_settled = false;
+        user_bet.bump = ctx.bumps.user_bet;
+
+        // Update global pool
+        let game_state = &mut ctx.accounts.game_state;
+        match prediction {
+            PredictionType::Higher => {
+                game_state.total_higher_pool = game_state
+                    .total_higher_pool
+                    .checked_add(bet_amount)
+                    .ok_or(GameError::MathOverflow)?;
+            }
+            PredictionType::Lower => {
+                game_state.total_lower_pool = game_state
+                    .total_lower_pool
+                    .checked_add(bet_amount)
+                    .ok_or(GameError::MathOverflow)?;
+            }
+        }
+
+        // Transfer SOL from user to program vault
+        let cpi_context = CpiContext::new(
+            ctx.accounts.system_program.to_account_info(),
+            anchor_lang::system_program::Transfer {
+                from: ctx.accounts.user.to_account_info(),
+                to: ctx.accounts.vault.to_account_info(),
+            },
+        );
+        anchor_lang::system_program::transfer(cpi_context, bet_amount)?;
+
+        msg!(
+            "Bet placed: {} SOL on {:?} at price {}",
+            bet_amount as f64 / 1_000_000_000.0,
+            prediction,
+            price_in_hundredths as f64 / 100.0
+        );
+
+        Ok(())
+    }
+
+    /// Settle bet after 5 seconds
+    pub fn settle_bet(ctx: Context<SettleBet>) -> Result<()> {
+        let clock = Clock::get()?;
+        let current_time = clock.unix_timestamp;
+        let user_bet = &mut ctx.accounts.user_bet;
+
+        // Check bet hasn't been settled
+        require!(!user_bet.is_settled, GameError::BetAlreadySettled);
+
+        // Check 5 seconds have passed
+        require!(
+            current_time >= user_bet.settlement_time,
+            GameError::SettlementTooEarly
+        );
+
+        // Get current SOL price from Pyth
+        let price_feed = load_price_feed_from_account_info(&ctx.accounts.pyth_price_account)
+            .map_err(|_| GameError::InvalidPriceAccount)?;
+        
+        let current_price = price_feed
+            .get_current_price()
+            .ok_or(GameError::PriceUnavailable)?;
+
+        require!(current_price.price > 0, GameError::InvalidPrice);
+
+        // Convert to hundredths
+        let exit_price = (current_price.price as i128)
+            .checked_mul(100)
+            .ok_or(GameError::MathOverflow)?
+            .checked_div(10i128.pow((-current_price.expo) as u32))
+            .ok_or(GameError::MathOverflow)? as i64;
+
+        // Determine if user won
+        let user_won = match user_bet.prediction {
+            PredictionType::Higher => exit_price > user_bet.entry_price,
+            PredictionType::Lower => exit_price < user_bet.entry_price,
+        };
+
+        let game_state = &mut ctx.accounts.game_state;
+        let mut payout: u64 = 0;
+
+        if user_won {
+            // Calculate payout: 1.15x bet (15% profit)
+            let (winning_pool, losing_pool) = match user_bet.prediction {
+                PredictionType::Higher => (game_state.total_higher_pool, game_state.total_lower_pool),
+                PredictionType::Lower => (game_state.total_lower_pool, game_state.total_higher_pool),
+            };
+
+            if losing_pool > 0 {
+                // Calculate ideal winnings: 15% of bet amount
+                let ideal_winnings = (user_bet.bet_amount as u128)
+                    .checked_mul(15)
+                    .ok_or(GameError::MathOverflow)?
+                    .checked_div(100)
+                    .ok_or(GameError::MathOverflow)? as u64;
+
+                // Calculate total ideal winnings needed for all winners (15% of winning pool)
+                let total_ideal_winnings = (winning_pool as u128)
+                    .checked_mul(15)
+                    .ok_or(GameError::MathOverflow)?
+                    .checked_div(100)
+                    .ok_or(GameError::MathOverflow)? as u64;
+
+                let gross_winnings = if losing_pool >= total_ideal_winnings {
+                    // Enough in losing pool for everyone to get 1.15x
+                    ideal_winnings
+                } else {
+                    // Not enough - distribute proportionally
+                    // User gets: (their bet / winning pool) * losing pool
+                    let user_share = (user_bet.bet_amount as u128)
+                        .checked_mul(1_000_000_000)
+                        .ok_or(GameError::MathOverflow)?
+                        .checked_div(winning_pool as u128)
+                        .ok_or(GameError::MathOverflow)? as u64;
+
+                    (losing_pool as u128)
+                        .checked_mul(user_share as u128)
+                        .ok_or(GameError::MathOverflow)?
+                        .checked_div(1_000_000_000)
+                        .ok_or(GameError::MathOverflow)? as u64
+                };
+
+                // Calculate 2.5% house fee on winnings only
+                let house_fee = (gross_winnings as u128)
+                    .checked_mul(25)
+                    .ok_or(GameError::MathOverflow)?
+                    .checked_div(1000)
+                    .ok_or(GameError::MathOverflow)? as u64;
+
+                let net_winnings = gross_winnings
+                    .checked_sub(house_fee)
+                    .ok_or(GameError::MathOverflow)?;
+
+                // Total payout = original bet + net winnings
+                payout = user_bet.bet_amount
+                    .checked_add(net_winnings)
+                    .ok_or(GameError::MathOverflow)?;
+
+                // Update fee tracking
+                game_state.total_fees_collected = game_state
+                    .total_fees_collected
+                    .checked_add(house_fee)
+                    .ok_or(GameError::MathOverflow)?;
+
+                // Update pools
+                match user_bet.prediction {
+                    PredictionType::Higher => {
+                        game_state.total_higher_pool = game_state
+                            .total_higher_pool
+                            .checked_sub(user_bet.bet_amount)
+                            .ok_or(GameError::MathOverflow)?;
+                        game_state.total_lower_pool = game_state
+                            .total_lower_pool
+                            .checked_sub(gross_winnings)
+                            .ok_or(GameError::MathOverflow)?;
+                    }
+                    PredictionType::Lower => {
+                        game_state.total_lower_pool = game_state
+                            .total_lower_pool
+                            .checked_sub(user_bet.bet_amount)
+                            .ok_or(GameError::MathOverflow)?;
+                        game_state.total_higher_pool = game_state
+                            .total_higher_pool
+                            .checked_sub(gross_winnings)
+                            .ok_or(GameError::MathOverflow)?;
+                    }
+                }
+
+                let multiplier = if losing_pool >= total_ideal_winnings {
+                    1.15
+                } else {
+                    1.0 + (gross_winnings as f64 / user_bet.bet_amount as f64)
+                };
+
+                msg!(
+                    "User WON! Multiplier: {:.2}x, Fee: {} SOL, Payout: {} SOL",
+                    multiplier,
+                    house_fee as f64 / 1_000_000_000.0,
+                    payout as f64 / 1_000_000_000.0
+                );
+            } else {
+                // No opposing bets, return original bet
+                payout = user_bet.bet_amount;
+                
+                // Remove from pool
+                match user_bet.prediction {
+                    PredictionType::Higher => {
+                        game_state.total_higher_pool = game_state
+                            .total_higher_pool
+                            .checked_sub(user_bet.bet_amount)
+                            .ok_or(GameError::MathOverflow)?;
+                    }
+                    PredictionType::Lower => {
+                        game_state.total_lower_pool = game_state
+                            .total_lower_pool
+                            .checked_sub(user_bet.bet_amount)
+                            .ok_or(GameError::MathOverflow)?;
+                    }
+                }
+                
+                msg!("No opposing bets, returning original bet");
+            }
+        } else {
+            // User lost - bet stays in pool for winners
+            msg!("User LOST - bet remains in pool");
+            
+            // Remove user's bet from their side of pool since it's now available to winners
+            match user_bet.prediction {
+                PredictionType::Higher => {
+                    game_state.total_higher_pool = game_state
+                        .total_higher_pool
+                        .checked_sub(user_bet.bet_amount)
+                        .ok_or(GameError::MathOverflow)?;
+                }
+                PredictionType::Lower => {
+                    game_state.total_lower_pool = game_state
+                        .total_lower_pool
+                        .checked_sub(user_bet.bet_amount)
+                        .ok_or(GameError::MathOverflow)?;
+                }
+            }
+        }
+
+        // Mark as settled
+        user_bet.is_settled = true;
+
+        // Transfer payout if user won
+        if payout > 0 {
+            let seeds = &[
+                b"vault",
+                &[ctx.accounts.vault.bump],
+            ];
+            let signer = &[&seeds[..]];
+
+            let cpi_context = CpiContext::new_with_signer(
+                ctx.accounts.system_program.to_account_info(),
+                anchor_lang::system_program::Transfer {
+                    from: ctx.accounts.vault.to_account_info(),
+                    to: ctx.accounts.user.to_account_info(),
+                },
+                signer,
+            );
+            anchor_lang::system_program::transfer(cpi_context, payout)?;
+        }
+
+        msg!(
+            "Bet settled: Entry {} -> Exit {} ({})",
+            user_bet.entry_price as f64 / 100.0,
+            exit_price as f64 / 100.0,
+            if user_won { "WON" } else { "LOST" }
+        );
+
+        Ok(())
+    }
+
+    /// Withdraw accumulated fees (authority only)
+    pub fn withdraw_fees(ctx: Context<WithdrawFees>, amount: u64) -> Result<()> {
+        let game_state = &mut ctx.accounts.game_state;
+
+        require!(
+            amount <= game_state.total_fees_collected,
+            GameError::InsufficientFees
+        );
+
+        game_state.total_fees_collected = game_state
+            .total_fees_collected
+            .checked_sub(amount)
+            .ok_or(GameError::MathOverflow)?;
+
+        let seeds = &[
+            b"vault",
+            &[ctx.accounts.vault.bump],
+        ];
+        let signer = &[&seeds[..]];
+
+        let cpi_context = CpiContext::new_with_signer(
+            ctx.accounts.system_program.to_account_info(),
+            anchor_lang::system_program::Transfer {
+                from: ctx.accounts.vault.to_account_info(),
+                to: ctx.accounts.authority.to_account_info(),
+            },
+            signer,
+        );
+        anchor_lang::system_program::transfer(cpi_context, amount)?;
+
+        msg!("Fees withdrawn: {} SOL", amount as f64 / 1_000_000_000.0);
+        Ok(())
+    }
+
+    /// Emergency pause (authority only)
+    pub fn pause_game(ctx: Context<PauseGame>) -> Result<()> {
+        let game_state = &mut ctx.accounts.game_state;
+        game_state.is_paused = true;
+        msg!("Game paused");
+        Ok(())
+    }
+
+    /// Unpause game (authority only)
+    pub fn unpause_game(ctx: Context<UnpauseGame>) -> Result<()> {
+        let game_state = &mut ctx.accounts.game_state;
+        game_state.is_paused = false;
+        msg!("Game unpaused");
+        Ok(())
+    }
+}
+
+// ============================================================================
+// Account Structures
+// ============================================================================
+
+#[account]
+pub struct GameState {
+    pub authority: Pubkey,           // Your wallet: 7R2h2ny2Ku9YizYbjVKAXZgyg5V669uQpLFRSvkWQgEU
+    pub total_higher_pool: u64,      // Total SOL in HIGHER bets
+    pub total_lower_pool: u64,       // Total SOL in LOWER bets
+    pub total_fees_collected: u64,   // Accumulated house fees
+    pub is_paused: bool,             // Emergency pause flag
+    pub bump: u8,                    // PDA bump
+}
+
+#[account]
+pub struct UserBet {
+    pub user: Pubkey,                // User's wallet
+    pub bet_amount: u64,             // Bet size in lamports
+    pub prediction: PredictionType,  // HIGHER or LOWER
+    pub entry_price: i64,            // SOL price when bet placed (in hundredths)
+    pub entry_time: i64,             // Timestamp when bet placed
+    pub settlement_time: i64,        // Timestamp when bet can be settled
+    pub is_settled: bool,            // Whether bet has been settled
+    pub bump: u8,                    // PDA bump
+}
+
+#[account]
+pub struct Vault {
+    pub bump: u8,
+}
+
+// ============================================================================
+// Context Structures
+// ============================================================================
+
+#[derive(Accounts)]
+pub struct Initialize<'info> {
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + size_of::<GameState>(),
+        seeds = [b"game_state"],
+        bump
+    )]
+    pub game_state: Account<'info, GameState>,
+
+    #[account(
+        init,
+        payer = authority,
+        space = 8 + size_of::<Vault>(),
+        seeds = [b"vault"],
+        bump
+    )]
+    pub vault: Account<'info, Vault>,
+
+    #[account(mut, address = "7R2h2ny2Ku9YizYbjVKAXZgyg5V669uQpLFRSvkWQgEU".parse::<Pubkey>().unwrap())]
+    pub authority: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct PlaceBet<'info> {
+    #[account(
+        mut,
+        seeds = [b"game_state"],
+        bump = game_state.bump,
+        constraint = !game_state.is_paused @ GameError::GamePaused
+    )]
+    pub game_state: Account<'info, GameState>,
+
+    #[account(
+        init,
+        payer = user,
+        space = 8 + size_of::<UserBet>(),
+        seeds = [b"user_bet", user.key().as_ref()],
+        bump
+    )]
+    pub user_bet: Account<'info, UserBet>,
+
+    #[account(
+        mut,
+        seeds = [b"vault"],
+        bump
+    )]
+    pub vault: Account<'info, Vault>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    /// Pyth SOL/USD price account
+    /// CHECK: Validated in instruction handler
+    pub pyth_price_account: AccountInfo<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct SettleBet<'info> {
+    #[account(
+        mut,
+        seeds = [b"game_state"],
+        bump = game_state.bump
+    )]
+    pub game_state: Account<'info, GameState>,
+
+    #[account(
+        mut,
+        seeds = [b"user_bet", user.key().as_ref()],
+        bump = user_bet.bump,
+        has_one = user @ GameError::Unauthorized,
+        close = user
+    )]
+    pub user_bet: Account<'info, UserBet>,
+
+    #[account(
+        mut,
+        seeds = [b"vault"],
+        bump
+    )]
+    pub vault: Account<'info, Vault>,
+
+    #[account(mut)]
+    pub user: Signer<'info>,
+
+    /// Pyth SOL/USD price account
+    /// CHECK: Validated in instruction handler
+    pub pyth_price_account: AccountInfo<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct WithdrawFees<'info> {
+    #[account(
+        mut,
+        seeds = [b"game_state"],
+        bump = game_state.bump,
+        has_one = authority @ GameError::Unauthorized
+    )]
+    pub game_state: Account<'info, GameState>,
+
+    #[account(
+        mut,
+        seeds = [b"vault"],
+        bump
+    )]
+    pub vault: Account<'info, Vault>,
+
+    #[account(mut)]
+    pub authority: Signer<'info>,
+
+    pub system_program: Program<'info, System>,
+}
+
+#[derive(Accounts)]
+pub struct PauseGame<'info> {
+    #[account(
+        mut,
+        seeds = [b"game_state"],
+        bump = game_state.bump,
+        has_one = authority @ GameError::Unauthorized
+    )]
+    pub game_state: Account<'info, GameState>,
+
+    pub authority: Signer<'info>,
+}
+
+#[derive(Accounts)]
+pub struct UnpauseGame<'info> {
+    #[account(
+        mut,
+        seeds = [b"game_state"],
+        bump = game_state.bump,
+        has_one = authority @ GameError::Unauthorized
+    )]
+    pub game_state: Account<'info, GameState>,
+
+    pub authority: Signer<'info>,
+}
+
+// ============================================================================
+// Enums and Types
+// ============================================================================
+
+#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, Debug, PartialEq)]
+pub enum PredictionType {
+    Higher,
+    Lower,
+}
+
+// ============================================================================
+// Error Codes
+// ============================================================================
+
+#[error_code]
+pub enum GameError {
+    #[msg("Bet amount is below minimum (0.01 SOL)")]
+    BetTooSmall,
+
+    #[msg("Bet amount exceeds maximum (20 SOL)")]
+    BetTooLarge,
+
+    #[msg("Invalid Pyth price account")]
+    InvalidPriceAccount,
+
+    #[msg("Price data unavailable")]
+    PriceUnavailable,
+
+    #[msg("Invalid price received")]
+    InvalidPrice,
+
+    #[msg("Math operation overflow")]
+    MathOverflow,
+
+    #[msg("Bet already settled")]
+    BetAlreadySettled,
+
+    #[msg("Must wait 5 seconds before settlement")]
+    SettlementTooEarly,
+
+    #[msg("Insufficient fees available for withdrawal")]
+    InsufficientFees,
+
+    #[msg("Unauthorized: Only program authority can perform this action")]
+    Unauthorized,
+
+    #[msg("Game is currently paused")]
+    GamePaused,
+}
